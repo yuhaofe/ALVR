@@ -1,5 +1,4 @@
 mod interaction;
-
 use alvr_client_core::{opengl::RenderViewInput, ClientCoreEvent};
 use alvr_common::{
     error,
@@ -8,7 +7,7 @@ use alvr_common::{
     parking_lot::RwLock,
     warn, DeviceMotion, Fov, Pose, RelaxedAtomic, HEAD_ID, LEFT_HAND_ID, RIGHT_HAND_ID,
 };
-use alvr_packets::{FaceData, Tracking};
+use alvr_packets::{ButtonEntry, ButtonValue, FaceData, Tracking};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, FaceTrackingSourcesConfig,
     FoveatedEncodingConfig,
@@ -29,6 +28,7 @@ use std::{
 const MAX_PREDICTION: Duration = Duration::from_millis(70);
 const IPD_CHANGE_EPS: f32 = 0.001;
 const DECODER_MAX_TIMEOUT_MULTIPLIER: f32 = 0.8;
+
 
 // Platform of the device. It is used to match the VR runtime and enable features conditionally.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -281,8 +281,8 @@ pub fn create_swapchain(
 fn stream_input_pipeline(
     xr_ctx: &XrContext,
     interaction_ctx: &InteractionContext,
-    stream_ctx: &mut StreamInputContext,
-) {
+    stream_ctx: &mut StreamInputContext
+) -> Option<Vec<(u64, ButtonValue)>> {
     // Streaming related inputs are updated here. Make sure every input poll is done in this
     // thread
     if let Err(e) = xr_ctx
@@ -290,12 +290,12 @@ fn stream_input_pipeline(
         .sync_actions(&[(&interaction_ctx.action_set).into()])
     {
         error!("{e}");
-        return;
+        return None;
     }
 
     let Some(now) = xr_runtime_now(&xr_ctx.instance) else {
         error!("Cannot poll tracking: invalid time");
-        return;
+        return None;
     };
 
     let target_timestamp = now
@@ -409,10 +409,21 @@ fn stream_input_pipeline(
 
     let button_entries =
         interaction::update_buttons(&xr_ctx.session, &interaction_ctx.button_actions);
+
+    let returnval: Vec<(u64, ButtonValue)> = button_entries
+        .iter()
+        .map(|e: &ButtonEntry| (e.path_id, e.value))
+        .collect();
+
     if !button_entries.is_empty() {
         alvr_client_core::send_buttons(button_entries);
     }
+
+    Some(returnval)
 }
+
+// TODO can I get this into the configuration object?
+static mut passthrough_enable: bool = false;
 
 fn initialize_stream(
     xr_ctx: &XrContext,
@@ -542,11 +553,41 @@ fn initialize_stream(
         let running = Arc::clone(&running);
         let interaction_ctx = Arc::clone(&interaction_ctx);
         let input_rate = config.refresh_rate_hint;
+        let mut button1_state = false;
+        let mut button2_state = false;
+
         move || {
             let mut deadline = Instant::now();
             let frame_interval = Duration::from_secs_f32(1.0 / input_rate);
             while running.value() {
-                stream_input_pipeline(&xr_ctx, &interaction_ctx, &mut input_context);
+                
+                let buttons: Option<Vec<(u64, ButtonValue)>> = stream_input_pipeline(&xr_ctx, &interaction_ctx, &mut input_context);
+                if buttons.is_some() {  // TODO this is way too verbose cause I don't know rust
+                    for (button_id, _button_value) in &buttons.unwrap() {
+                        if *button_id == *alvr_common::RIGHT_A_CLICK_ID {
+                            if let ButtonValue::Binary(true) = _button_value {
+                                button1_state = true;
+                            } else {
+                                button1_state = false;
+                            }
+                        }
+                        if *button_id == *alvr_common::RIGHT_B_CLICK_ID {
+                            if let ButtonValue::Binary(true) = _button_value {
+                                button2_state = true;
+                            } else {
+                                button2_state = false;
+                            }
+
+                        }
+                        if button1_state && button2_state {
+                            println!("BUTTON You are toggling the effect");
+                            // Massive TODOs
+                            unsafe {
+                                passthrough_enable = !passthrough_enable;
+                            }
+                        }
+                    }
+                }
 
                 deadline += frame_interval / 3;
                 thread::sleep(deadline.saturating_duration_since(Instant::now()));
@@ -615,6 +656,7 @@ pub fn entry_point() {
     exts.htc_facial_tracking = available_extensions.htc_facial_tracking;
     exts.htc_vive_focus3_controller_interaction =
         available_extensions.htc_vive_focus3_controller_interaction;
+    exts.fb_passthrough = available_extensions.fb_passthrough;
     #[cfg(target_os = "android")]
     {
         exts.khr_android_create_instance = true;
@@ -658,6 +700,20 @@ pub fn entry_point() {
             system: xr_system,
             session: xr_session.clone(),
         };
+
+        //if exts.fb_passthrough {
+        let passthrough = xr_session
+            .create_passthrough(xr::PassthroughFlagsFB::IS_RUNNING_AT_CREATION)
+            .unwrap();
+
+        let _passthrough_layer = xr_session.create_passthrough_layer(
+            &passthrough, 
+            xr::PassthroughFlagsFB::IS_RUNNING_AT_CREATION,
+            xr::PassthroughLayerPurposeFB::RECONSTRUCTION
+        ).unwrap();
+        // } else {
+        //     warn!("exts.fb_passthrough is not supported on this device. Passthrough will be disabled.");
+        // }
 
         let views_config = xr_instance
             .enumerate_view_configuration_views(
@@ -1043,31 +1099,41 @@ pub fn entry_point() {
                 },
             };
 
+            let projection_views_layers = [
+                xr::CompositionLayerProjectionView::new()
+                    .pose(views[0].pose)
+                    .fov(views[0].fov)
+                    .sub_image(
+                        xr::SwapchainSubImage::new()
+                            .swapchain(&swapchains[0])
+                            .image_array_index(0)
+                            .image_rect(rect),
+                    ),
+                xr::CompositionLayerProjectionView::new()
+                    .pose(views[1].pose)
+                    .fov(views[1].fov)
+                    .sub_image(
+                        xr::SwapchainSubImage::new()
+                            .swapchain(&swapchains[1])
+                            .image_array_index(0)
+                            .image_rect(rect),
+                    ),
+            ];
+            
+            let space = session_context.reference_space.read();
+            let mut stream_layer = xr::CompositionLayerProjection::<xr::OpenGlEs>::new().space(&space).views(&projection_views_layers);
+
+            //if exts.fb_passthrough {
+            let mut stream_layer_raw = stream_layer.into_raw();
+            //set this layer to blend with any previous layers using the alpha channel
+            stream_layer_raw.layer_flags = xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA;
+            unsafe { stream_layer = xr::CompositionLayerProjection::from_raw(stream_layer_raw) };
+            //}
+
             let res = xr_frame_stream.end(
                 to_xr_time(display_time),
                 xr::EnvironmentBlendMode::OPAQUE,
-                &[&xr::CompositionLayerProjection::new()
-                    .space(&session_context.reference_space.read())
-                    .views(&[
-                        xr::CompositionLayerProjectionView::new()
-                            .pose(views[0].pose)
-                            .fov(views[0].fov)
-                            .sub_image(
-                                xr::SwapchainSubImage::new()
-                                    .swapchain(&swapchains[0])
-                                    .image_array_index(0)
-                                    .image_rect(rect),
-                            ),
-                        xr::CompositionLayerProjectionView::new()
-                            .pose(views[1].pose)
-                            .fov(views[1].fov)
-                            .sub_image(
-                                xr::SwapchainSubImage::new()
-                                    .swapchain(&swapchains[1])
-                                    .image_array_index(0)
-                                    .image_rect(rect),
-                            ),
-                    ])],
+                &[&stream_layer]
             );
 
             if let Err(e) = res {
