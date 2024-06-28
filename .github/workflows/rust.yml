@@ -5,6 +5,7 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -113,6 +114,11 @@ jobs:
         working-directory: ./alvr/client_openxr
         run:
           cargo apk build
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4.3.3
+        with:
+          path: ./target/debug/apk/
 
   tests:
     runs-on: ubuntu-latest
